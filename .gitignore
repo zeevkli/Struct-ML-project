@@ -1,0 +1,13 @@
+*/processed/*
+*/checkpoints/*
+*/results/*
+*/logs/*
+*/wandb/*
+*/wandb_tmp/*
+.claude/*
+*.pyc
+*.pt
+*.log
+*.bak
+__pycache__/
+slurm*

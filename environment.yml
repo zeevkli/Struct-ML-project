@@ -1,0 +1,29 @@
+name: structml1
+channels:
+  - pytorch
+  - nvidia
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    # torch-scatter / torch-sparse have no PyPI source build;
+    # --find-links points pip to PyG's pre-built CUDA wheels.
+    - --find-links https://data.pyg.org/whl/torch-2.4.1+cu121.html
+    - torch==2.4.1+cu121
+    - torch-geometric==2.7.0
+    - torch-scatter
+    - torch-sparse
+    - torch-frame
+    - relbench==2.1.2
+    - scikit-learn
+    - pandas
+    - numpy
+    - wandb
+    - filelock
+    - tqdm
+    - duckdb          # required by relbench task table generation
+    - pyarrow         # required by rel-amazon dataset
+    - pooch           # required by relbench for dataset download
