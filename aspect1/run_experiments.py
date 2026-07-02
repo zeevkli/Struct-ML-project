@@ -50,7 +50,7 @@ def ckpt_path(cfg) -> Path:
 
 def run_config(cfg, verbose=True):
     cmd = [
-        PYTHON, "train.py",
+        PYTHON, "-u", "train.py",
         "--dataset",    cfg["dataset"],
         "--task",       cfg["task"],
         "--arch",       cfg["arch"],

@@ -107,7 +107,12 @@ def load_meta(dataset: str, task: str) -> dict:
 def make_loader(data, target_node: str, mask_attr: str, batch_size: int,
                 num_neighbors: int, num_layers: int, shuffle: bool):
     mask = getattr(data[target_node], mask_attr)
-    num_n = {et: [num_neighbors] * num_layers for et in data.edge_types}
+    # Scale neighbors per hop so total fan-out stays constant across depths.
+    # With many edge types (e.g. 22 for rel-stack), num_neighbors applies per
+    # edge type per hop — without scaling, L=2 creates ~10×22×10×22 ≈ 48k
+    # nodes per root and L=3 approaches millions, hanging the training loop.
+    per_hop = max(2, num_neighbors // num_layers)
+    num_n = {et: [per_hop] * num_layers for et in data.edge_types}
     return NeighborLoader(
         data,
         num_neighbors=num_n,

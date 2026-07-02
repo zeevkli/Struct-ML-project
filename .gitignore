@@ -1,6 +1,7 @@
 */processed/*
 */checkpoints/*
 */results/*
+!*/results/metrics.csv
 */logs/*
 */wandb/*
 */wandb_tmp/*
