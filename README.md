@@ -26,8 +26,16 @@ pip install torch-scatter torch-sparse \
 ```
 structML_project/
 ├── environment.yml      ← shared conda environment
-└── aspect1/             ← GNN directionality experiment
-    ├── README.md        ← how to run aspect1
+├── aspect1/             ← GNN directionality experiment (MPNN-U / MPNN-D / Dir-GNN)
+│   ├── README.md        ← how to run aspect1
+│   ├── notebook.ipynb   ← main entry point
+│   ├── preprocess.py
+│   ├── models.py
+│   ├── train.py
+│   ├── run_experiments.py
+│   └── run_all.sh
+└── aspect3/             ← node-features experiment (ID / column-wise / LLM, HGT)
+    ├── README.md        ← how to run aspect3
     ├── notebook.ipynb   ← main entry point
     ├── preprocess.py
     ├── models.py
@@ -35,3 +43,6 @@ structML_project/
     ├── run_experiments.py
     └── run_all.sh
 ```
+
+Each aspect is a **self-contained folder** (its own preprocessing, models, training,
+runner, and notebook), so aspects can be developed and run independently.

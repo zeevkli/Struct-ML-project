@@ -18,9 +18,11 @@ dependencies:
     - torch-sparse
     - torch-frame
     - relbench==2.1.2
+    - sentence-transformers   # aspect3: LLM node-feature encoding
     - scikit-learn
     - pandas
     - numpy
+    - matplotlib   # notebooks (all aspects) render figures with matplotlib
     - wandb
     - filelock
     - tqdm
