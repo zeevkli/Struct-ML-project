@@ -17,7 +17,8 @@ All models:
   - ReLU between layers
   - Per-node-type lazy init via (-1,-1) in SAGEConv/GATConv handles varying
     raw feature dims across node types without explicit input projection layers.
-  - Binary output: Linear(hidden_dim→1) + Sigmoid
+  - Binary output (num_classes=1):  Linear(hidden_dim→1) + Sigmoid → scalar
+  - Multiclass output (num_classes>1): Linear(hidden_dim→num_classes) → raw logits [N, K]
 """
 
 import torch
@@ -143,6 +144,7 @@ class MPNNModel(nn.Module):
         arch: str,
         mode: str,
         dropout: float,
+        num_classes: int = 1,
     ):
         super().__init__()
         node_types, edge_types = metadata
@@ -159,7 +161,8 @@ class MPNNModel(nn.Module):
                 homo = HomoGAT1(hidden_dim // 2, heads=2)
             self.convs.append(to_hetero(homo, active_meta))
 
-        self.head = nn.Linear(hidden_dim, 1)
+        self.head = nn.Linear(hidden_dim, num_classes)
+        self.num_classes = num_classes
         self.target_node_type = target_node_type
         self.mode    = mode
         self.dropout = dropout
@@ -184,7 +187,10 @@ class MPNNModel(nn.Module):
 
         out = x_dict[self.target_node_type]
         out = F.dropout(out, p=self.dropout, training=self.training)
-        return torch.sigmoid(self.head(out)).squeeze(-1)
+        logits = self.head(out)
+        if self.num_classes == 1:
+            return torch.sigmoid(logits).squeeze(-1)
+        return logits  # [N, num_classes] raw logits for CrossEntropyLoss
 
 
 class DirGNNModel(nn.Module):
@@ -201,6 +207,7 @@ class DirGNNModel(nn.Module):
         num_layers: int,
         arch: str,
         dropout: float,
+        num_classes: int = 1,
     ):
         super().__init__()
         node_types, edge_types = metadata
@@ -212,7 +219,8 @@ class DirGNNModel(nn.Module):
                         hidden_dim, arch, dropout)
             for _ in range(num_layers)
         ])
-        self.head = nn.Linear(hidden_dim, 1)
+        self.head = nn.Linear(hidden_dim, num_classes)
+        self.num_classes = num_classes
         self.target_node_type = target_node_type
         self.dropout = dropout
 
@@ -225,7 +233,10 @@ class DirGNNModel(nn.Module):
 
         out = x_dict[self.target_node_type]
         out = F.dropout(out, p=self.dropout, training=self.training)
-        return torch.sigmoid(self.head(out)).squeeze(-1)
+        logits = self.head(out)
+        if self.num_classes == 1:
+            return torch.sigmoid(logits).squeeze(-1)
+        return logits  # [N, num_classes] raw logits for CrossEntropyLoss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -240,23 +251,14 @@ def build_model(
     num_layers: int,
     hidden_dim: int = 64,
     dropout: float = 0.3,
+    num_classes: int = 1,
 ) -> nn.Module:
-    """
-    Args:
-        metadata:          (node_types, edge_types) from HeteroData.metadata()
-        target_node_type:  node type to predict labels for
-        arch:              'sage' or 'gat'
-        mode:              'mpnn_u', 'mpnn_d', or 'dir_gnn'
-        num_layers:        number of message-passing layers
-        hidden_dim:        latent dimension (default 64)
-        dropout:           dropout probability (default 0.3)
-    """
     if mode in ("mpnn_u", "mpnn_d"):
         return MPNNModel(metadata, target_node_type, hidden_dim,
-                         num_layers, arch, mode, dropout)
+                         num_layers, arch, mode, dropout, num_classes)
     else:
         return DirGNNModel(metadata, target_node_type, hidden_dim,
-                           num_layers, arch, dropout)
+                           num_layers, arch, dropout, num_classes)
 
 
 def count_parameters(model: nn.Module) -> int:

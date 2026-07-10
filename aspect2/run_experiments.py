@@ -1,12 +1,16 @@
 """
-run_experiments.py  —  Run all 36 experiment configurations.
+run_experiments.py  —  Run all experiment configurations for Aspect 2.
 
-36 runs = 2 tasks × 3 modes × 2 archs × 3 layers × 1 seed (seed=0)
+Main grid:    3 tasks × 3 archs × 4 settings × 1 seed = 36 runs
+  settings: homo, hetero, homo_noenc (no per-type encoders), hybrid (hetero layer 1 + homo rest)
+Ablation:     3 tasks × 3 archs × homo only  × 1 seed =  9 runs  (hidden_dim=128)
+Total: 45 runs  (homo & hetero cached from first pass — 18 new runs)
 
 Skips runs whose checkpoint already exists.
-Called from the notebook, or can be run standalone:
+Called from the notebook, or run standalone:
   python run_experiments.py
-  python run_experiments.py --dry_run   # show what would run
+  python run_experiments.py --dry_run    # show what would run
+  python run_experiments.py --ablation   # run ablation only
 """
 
 import argparse
@@ -21,33 +25,51 @@ PYTHON      = sys.executable
 TASKS = [
     ("rel-stack",  "user-engagement"),
     ("rel-avito",  "user-visits"),
-    ("rel-stack",  "post-votes"),
     ("rel-arxiv",  "author-category"),
 ]
-ARCHS  = ["sage", "gat"]
-MODES  = ["mpnn_u", "mpnn_d", "dir_gnn"]
-LAYERS = [1, 2, 3]
-SEED   = 0
+ARCHS     = ["sage", "gat", "hgt"]
+SETTINGS  = ["homo", "hetero", "homo_noenc", "hybrid"]
+LAYERS    = [2, 3]
+SEED      = 0
+HIDDEN_DIM_MAIN     = 64
+HIDDEN_DIM_ABLATION = 128
 
 
 def all_configs():
+    # Main grid: all settings at hidden_dim=64, layers in LAYERS
     for dataset, task in TASKS:
         for arch in ARCHS:
-            for mode in MODES:
+            for setting in SETTINGS:
                 for num_layers in LAYERS:
                     yield dict(
                         dataset    = dataset,
                         task       = task,
                         arch       = arch,
-                        mode       = mode,
+                        setting    = setting,
                         num_layers = num_layers,
+                        hidden_dim = HIDDEN_DIM_MAIN,
                         seed       = SEED,
+                        ablation   = False,
                     )
+    # Ablation: homo at hidden_dim=128, layers in LAYERS
+    for dataset, task in TASKS:
+        for arch in ARCHS:
+            for num_layers in LAYERS:
+                yield dict(
+                    dataset    = dataset,
+                    task       = task,
+                    arch       = arch,
+                    setting    = "homo",
+                    num_layers = num_layers,
+                    hidden_dim = HIDDEN_DIM_ABLATION,
+                    seed       = SEED,
+                    ablation   = True,
+                )
 
 
 def ckpt_path(cfg) -> Path:
     return (CHECKPOINTS / cfg["dataset"] / cfg["task"]
-            / f"{cfg['arch']}_{cfg['mode']}_L{cfg['num_layers']}_s{cfg['seed']}.pt")
+            / f"{cfg['arch']}_{cfg['setting']}_h{cfg['hidden_dim']}_L{cfg['num_layers']}_s{cfg['seed']}.pt")
 
 
 def run_config(cfg, verbose=True, force=False):
@@ -56,14 +78,15 @@ def run_config(cfg, verbose=True, force=False):
         "--dataset",    cfg["dataset"],
         "--task",       cfg["task"],
         "--arch",       cfg["arch"],
-        "--mode",       cfg["mode"],
+        "--setting",    cfg["setting"],
         "--num_layers", str(cfg["num_layers"]),
+        "--hidden_dim", str(cfg["hidden_dim"]),
         "--seed",       str(cfg["seed"]),
     ]
     if not force:
         cmd.append("--skip_if_exists")
     label = (f"{cfg['dataset']}/{cfg['task']}  "
-             f"{cfg['arch']}  {cfg['mode']}  L={cfg['num_layers']}")
+             f"{cfg['arch']}  {cfg['setting']}  h={cfg['hidden_dim']}")
     if verbose:
         print(f"\n{'─'*60}")
         print(f"Running: {label}")
@@ -76,13 +99,19 @@ def run_config(cfg, verbose=True, force=False):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dry_run", action="store_true",
-                   help="Print configs without running.")
-    p.add_argument("--force", action="store_true",
+    p.add_argument("--dry_run",  action="store_true", help="Print configs without running.")
+    p.add_argument("--ablation", action="store_true", help="Run ablation configs only.")
+    p.add_argument("--main",     action="store_true", help="Run main grid only (no ablation).")
+    p.add_argument("--force",    action="store_true",
                    help="Re-run all configs, overwriting existing checkpoints and results.")
     args = p.parse_args()
 
     configs = list(all_configs())
+    if args.ablation:
+        configs = [c for c in configs if c["ablation"]]
+    elif args.main:
+        configs = [c for c in configs if not c["ablation"]]
+
     pending = configs if args.force else [c for c in configs if not ckpt_path(c).exists()]
     done    = len(configs) - len(pending)
 
@@ -95,15 +124,15 @@ def main():
     if args.dry_run:
         print("\nPending runs:")
         for cfg in pending:
-            label = (f"  {cfg['dataset']}/{cfg['task']}  "
-                     f"{cfg['arch']}  {cfg['mode']}  L={cfg['num_layers']}")
-            print(label)
+            tag = "[ablation]" if cfg["ablation"] else ""
+            print(f"  {cfg['dataset']}/{cfg['task']}  "
+                  f"{cfg['arch']}  {cfg['setting']}  h={cfg['hidden_dim']}  {tag}")
         return
 
     failed = []
     for i, cfg in enumerate(pending, 1):
         label = (f"{cfg['dataset']}/{cfg['task']}  "
-                 f"{cfg['arch']}  {cfg['mode']}  L={cfg['num_layers']}")
+                 f"{cfg['arch']}  {cfg['setting']}  h={cfg['hidden_dim']}")
         print(f"\n[{i}/{len(pending)}] {label}")
         ok = run_config(cfg, verbose=False, force=args.force)
         if not ok:

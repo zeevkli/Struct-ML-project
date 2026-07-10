@@ -3,15 +3,15 @@ train.py  —  Train one GNN variant on one (dataset, task) combination.
 
 Usage:
   python train.py --dataset rel-stack --task user-engagement \
-                  --arch sage --mode mpnn_u --num_layers 2 --seed 0
+                  --arch sage --setting homo --seed 0
 
 The script:
   1. Loads preprocessed .pt files from processed/{dataset}/{task}/
-  2. Builds the model (MPNNModel or DirGNNModel)
+  2. Builds the model (HomoModel or HeteroModel)
   3. Trains with NeighborLoader + Adam + BCE loss
   4. Early stopping (patience=10) on val AUPRC
   5. Evaluates best checkpoint on val & test
-  6. Saves model checkpoint to checkpoints/{dataset}/{task}/{arch}_{mode}_L{layers}_s{seed}.pt
+  6. Saves model checkpoint to checkpoints/{dataset}/{task}/{arch}_{setting}_h{hidden_dim}_s{seed}.pt
   7. Appends one row to results/metrics.csv (file-locked)
 """
 
@@ -36,22 +36,17 @@ from torch_geometric.loader import NeighborLoader
 
 from models import build_model, count_parameters
 
-ROOT            = Path(__file__).parent
-PROCESSED       = ROOT / "processed"
-RESULTS         = ROOT / "results"
-CHECKPOINTS     = ROOT / "checkpoints"
+ROOT        = Path(__file__).parent
+PROCESSED   = ROOT / "processed"
+RESULTS     = ROOT / "results"
+CHECKPOINTS = ROOT / "checkpoints"
 RESULTS.mkdir(exist_ok=True)
-METRICS_CSV     = RESULTS / "metrics.csv"
-
+METRICS_CSV  = RESULTS / "metrics.csv"
 CSV_COLS = [
-    "dataset", "task", "mode", "arch", "num_layers", "hidden_dim", "seed",
-    # binary classification metrics
+    "dataset", "task", "setting", "arch", "num_layers", "hidden_dim", "seed",
     "val_auc", "val_auprc", "val_precision", "val_recall",
-    # multiclass metrics
     "val_accuracy", "val_macro_f1",
-    # binary (test)
     "test_auc", "test_auprc", "test_precision", "test_recall",
-    # multiclass (test)
     "test_accuracy", "test_macro_f1",
     "train_time_sec", "num_params",
 ]
@@ -73,9 +68,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset",    required=True)
     p.add_argument("--task",       required=True)
-    p.add_argument("--mode",       required=True, choices=["mpnn_u", "mpnn_d", "dir_gnn"])
-    p.add_argument("--arch",       required=True, choices=["sage", "gat"])
-    p.add_argument("--num_layers", type=int, required=True, choices=[1, 2, 3])
+    p.add_argument("--setting",    required=True, choices=["homo", "hetero", "homo_noenc", "hybrid"])
+    p.add_argument("--arch",       required=True, choices=["sage", "gat", "hgt"])
+    p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--seed",       type=int, default=0)
     p.add_argument("--lr",         type=float, default=1e-3)
@@ -90,8 +85,8 @@ def parse_args():
     return p.parse_args()
 
 
-def checkpoint_path(dataset, task, arch, mode, num_layers, seed) -> Path:
-    return CHECKPOINTS / dataset / task / f"{arch}_{mode}_L{num_layers}_s{seed}.pt"
+def checkpoint_path(dataset, task, arch, setting, num_layers, hidden_dim, seed) -> Path:
+    return CHECKPOINTS / dataset / task / f"{arch}_{setting}_h{hidden_dim}_L{num_layers}_s{seed}.pt"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,10 +110,6 @@ def load_meta(dataset: str, task: str) -> dict:
 def make_loader(data, target_node: str, mask_attr: str, batch_size: int,
                 num_neighbors: int, num_layers: int, shuffle: bool):
     mask = getattr(data[target_node], mask_attr)
-    # Scale neighbors per hop so total fan-out stays constant across depths.
-    # With many edge types (e.g. 22 for rel-stack), num_neighbors applies per
-    # edge type per hop — without scaling, L=2 creates ~10×22×10×22 ≈ 48k
-    # nodes per root and L=3 approaches millions, hanging the training loop.
     per_hop = max(2, num_neighbors // num_layers)
     num_n = {et: [per_hop] * num_layers for et in data.edge_types}
     return NeighborLoader(
@@ -154,7 +145,7 @@ def run_epoch(model, loader, optimizer, target_node, train=True, num_classes=1):
             y     = batch[target_node].y[mask].to(DEVICE)
 
             if num_classes > 1:
-                valid = y >= 0  # -1 = unlabeled
+                valid = y >= 0
                 if not valid.any():
                     continue
                 loss = F.cross_entropy(y_hat[valid], y[valid])
@@ -214,7 +205,7 @@ def evaluate(model, loader, target_node, num_classes=1):
         return dict(auc=0.0, auprc=0.0, precision=0.0, recall=0.0)
 
     if num_classes > 1:
-        logits = np.concatenate(all_preds)       # [N, num_classes]
+        logits = np.concatenate(all_preds)
         labels = np.concatenate(all_labels).astype(int)
         pred_class = logits.argmax(axis=1)
         return dict(
@@ -260,7 +251,7 @@ def main():
         return
 
     ckpt = checkpoint_path(args.dataset, args.task, args.arch,
-                            args.mode, args.num_layers, args.seed)
+                            args.setting, args.num_layers, args.hidden_dim, args.seed)
     if args.skip_if_exists and ckpt.exists():
         print(f"Checkpoint exists, skipping: {ckpt}")
         return
@@ -271,6 +262,7 @@ def main():
     # ── load data ───────────────────────────────────────────────────────────
     meta        = load_meta(args.dataset, args.task)
     target_node = meta["target_node"]
+    feat_dims   = meta["node_feat_dims"]
     num_classes = meta.get("num_classes", 1)
 
     print(f"\nLoading graphs for {args.dataset}/{args.task} …")
@@ -283,15 +275,16 @@ def main():
     model = build_model(
         metadata         = metadata,
         target_node_type = target_node,
+        feat_dims        = feat_dims,
         arch             = args.arch,
-        mode             = args.mode,
+        setting          = args.setting,
         num_layers       = args.num_layers,
         hidden_dim       = args.hidden_dim,
         dropout          = args.dropout,
         num_classes      = num_classes,
     ).to(DEVICE)
 
-    # Warm-up: one tiny batch to instantiate lazy parameters before counting
+    # Warm-up: one tiny batch to instantiate lazy parameters (needed for hetero sage/gat)
     _warm_loader = make_loader(data_train, target_node, "mask",
                                batch_size=32, num_neighbors=1,
                                num_layers=args.num_layers, shuffle=False)
@@ -305,7 +298,7 @@ def main():
     del _warm_loader, _batch
 
     n_params = count_parameters(model)
-    print(f"Model: {args.arch}/{args.mode} L={args.num_layers}  params={n_params:,}")
+    print(f"Model: {args.arch}/{args.setting} L={args.num_layers} h={args.hidden_dim}  params={n_params:,}")
 
     # ── data loaders ────────────────────────────────────────────────────────
     train_loader = make_loader(data_train, target_node, "mask",
@@ -321,15 +314,13 @@ def main():
                                num_neighbors=args.num_neighbors,
                                num_layers=args.num_layers, shuffle=False)
 
-    optimizer = torch.optim.Adam(model.parameters(),
-                                 lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # ── training loop with early stopping ───────────────────────────────────
-    monitor_key = "accuracy" if num_classes > 1 else "auprc"
+    monitor_key    = "accuracy" if num_classes > 1 else "auprc"
     best_val_score = -1.0
     best_state     = None
     patience_count = 0
-    epoch_log      = []   # (epoch, val_score) for convergence analysis
     t0             = time.time()
 
     print(f"\nTraining on {DEVICE} …  (monitor={monitor_key})")
@@ -341,8 +332,6 @@ def main():
         val_metrics = evaluate(model, val_loader, target_node, num_classes=num_classes)
 
         val_score = val_metrics[monitor_key]
-        epoch_log.append((epoch, round(val_score, 6)))
-
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Ep {epoch:3d} | "
                   f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
@@ -379,7 +368,7 @@ def main():
     row = dict(
         dataset    = args.dataset,
         task       = args.task,
-        mode       = args.mode,
+        setting    = args.setting,
         arch       = args.arch,
         num_layers = args.num_layers,
         hidden_dim = args.hidden_dim,
@@ -392,12 +381,7 @@ def main():
 
     # ── save checkpoint ─────────────────────────────────────────────────────
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "state_dict": best_state,
-        "metrics":    row,
-        "args":       vars(args),
-        "epoch_log":  epoch_log,   # [(epoch, val_auprc), ...] for convergence plots
-    }, ckpt)
+    torch.save({"state_dict": best_state, "metrics": row, "args": vars(args)}, ckpt)
     print(f"Checkpoint saved: {ckpt}")
 
     append_csv(row)

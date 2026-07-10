@@ -1,6 +1,6 @@
 # Aspect 1 — GNN Directionality on Relational Data
 
-**36 runs** — 2 datasets × 2 archs × 3 modes × 3 layers × seed 0
+**72 runs** — 4 datasets × 2 archs × 3 modes × 3 layers × seed 0
 
 ---
 
@@ -26,7 +26,7 @@ completed checkpoints are skipped.
 # Preprocess (downloads datasets on first run)
 python preprocess.py
 
-# Run all 36 experiments (skips existing checkpoints)
+# Run all 72 experiments (skips existing checkpoints)
 python run_experiments.py
 
 # Preview what would run without executing
@@ -42,7 +42,21 @@ sbatch run_all.sh
 
 ---
 
+## Datasets
+
+| Dataset / Task | Target | Type | Expected |
+|---|---|---|---|
+| rel-stack / user-engagement | PK (users) | binary | MPNN-D or Dir-GNN — signal flows FK→PK |
+| rel-avito / user-visits | PK (users) | binary | MPNN-D or Dir-GNN |
+| rel-stack / post-votes | FK (posts) | binary | MPNN-U or Dir-GNN — useful signal flows PK→FK |
+| rel-arxiv / author-category | authors | multiclass (53) | Dir-GNN — directed citation edges carry distinct signals |
+
+The post-votes task reverses the FK/PK target, providing a direct test that the directionality effect is not an artifact of dataset choice.
+rel-arxiv/author-category adds a naturally directed citation graph with 53-class output (ArXiv subject categories).
+
+---
+
 ## Results
 
 `results/metrics.csv` — one row per run  
-`checkpoints/{dataset}/{task}/{arch}_{mode}_L{layers}_s{seed}.pt` — one file per run
+`checkpoints/{dataset}/{task}/{arch}_{mode}_L{layers}_s{seed}.pt` — one checkpoint per run

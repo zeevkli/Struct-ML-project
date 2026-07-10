@@ -8,7 +8,7 @@ Output layout:
 
 Run:
   python preprocess.py
-  python preprocess.py --dataset rel-stack --task user-engagement  # single combo
+  python preprocess.py --dataset rel-arxiv --task author-category  # single combo
 """
 
 import argparse
@@ -28,45 +28,23 @@ from relbench.tasks import get_task
 ROOT = Path(__file__).parent
 PROCESSED = ROOT / "processed"
 
-# Two tasks chosen to test GNN directionality across domains:
-#
-#   rel-stack / user-engagement  — user is a PARENT node (posts, comments, votes
-#       have FK→user). Signal flows naturally UP via FK→PK edges.
-#
-#   rel-avito / user-visits      — same structural argument: user is a parent of
-#       search/ad interaction tables. Different domain (classifieds vs Q&A).
-#
-# Both tasks favor FK→PK directionality (MPNN-D expected to be competitive).
-# The comparison across modes (MPNN-U, MPNN-D, Dir-GNN) measures whether
-# reverse edges add meaningful signal in user-level relational prediction.
 DATASET_TASKS = [
     ("rel-stack",  "user-engagement"),
-    ("rel-avito",  "user-visits"),
     ("rel-stack",  "post-votes"),
+    ("rel-avito",  "user-visits"),
     ("rel-arxiv",  "author-category"),
 ]
 
-# Regression tasks binarized to binary classification.
-# threshold t means: label = (raw_value > t).
-BINARIZE = {
-    ("rel-stack", "post-votes"): 0,  # votes > 0: "did this post receive any upvote?"
-}
-
-# Tasks with integer class labels stored as class index 0..K-1.
-# num_classes and label_min are determined at preprocess time from the label tables.
 MULTICLASS_TASKS: set = {("rel-arxiv", "author-category")}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# rel-stack compatibility patch
+# rel-stack / rel-avito compatibility patch
 # ──────────────────────────────────────────────────────────────────────────────
 
 def patch_rel_stack(dataset):
-    """
-    After db.upto(cutoff), pkey columns are no longer consecutive integers,
-    which causes validate_and_correct_db to raise RuntimeError. We no-op it.
-    Dangling FKs are handled naturally in our edge builder (skipped).
-    """
+    """After db.upto(cutoff), pkey columns are no longer consecutive integers,
+    which causes validate_and_correct_db to raise RuntimeError. We no-op it."""
     dataset.validate_and_correct_db = lambda db: None
 
 
@@ -86,7 +64,7 @@ def _is_categorical(series: pd.Series) -> bool:
     return not _is_numeric(series) and not _is_datetime(series)
 
 
-MAX_TEXT_LEN = 200  # drop string columns whose median value length exceeds this
+MAX_TEXT_LEN = 200
 
 def get_feature_df(table_df: pd.DataFrame, table) -> pd.DataFrame:
     """Drop PK, FK, time, and free-text columns; keep only feature columns."""
@@ -103,20 +81,18 @@ def get_feature_df(table_df: pd.DataFrame, table) -> pd.DataFrame:
         if table_df[c].dtype == object:
             sample = table_df[c].dropna().head(200)
             if len(sample) > 0 and sample.apply(lambda v: len(str(v))).median() > MAX_TEXT_LEN:
-                continue  # skip free-text columns
+                continue
         keep.append(c)
     return table_df[keep].copy()
 
 
 def _stringify_complex(series: pd.Series) -> pd.Series:
-    """Convert list/array cells to strings so OrdinalEncoder can handle them."""
     return series.apply(lambda v: str(v) if not isinstance(v, str) else v)
 
 
-MAX_CAT_CARDINALITY = 10_000  # drop text-like columns with too many unique values
+MAX_CAT_CARDINALITY = 10_000
 
 def _dt_offsets(feat_df: pd.DataFrame, dt_cols: list, cutoff: pd.Timestamp) -> np.ndarray:
-    """Days-since-cutoff for each datetime column, as a [N, len(dt_cols)] float32 array."""
     offs = []
     for col in dt_cols:
         ts = pd.to_datetime(feat_df[col], errors="coerce")
@@ -126,14 +102,6 @@ def _dt_offsets(feat_df: pd.DataFrame, dt_cols: list, cutoff: pd.Timestamp) -> n
 
 
 def fit_table_encoder(feat_df: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
-    """Fit encoders on training data. Returns encoder dict.
-
-    All three feature kinds (numeric, categorical codes, datetime offsets) are
-    standardized to mean 0 / std 1. Without this, OrdinalEncoder integer codes
-    and raw day-offsets (which can run into the tens of thousands) dominate the
-    properly-scaled numeric columns and the GNN fails to learn (loss plateaus,
-    AUC stays ~0.5).
-    """
     num_cols = [c for c in feat_df.columns if _is_numeric(feat_df[c])]
     dt_cols  = [c for c in feat_df.columns if _is_datetime(feat_df[c])]
     cat_cols = [c for c in feat_df.columns if _is_categorical(feat_df[c])
@@ -173,7 +141,6 @@ def fit_table_encoder(feat_df: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
 
 
 def apply_table_encoder(feat_df: pd.DataFrame, enc: dict) -> torch.Tensor:
-    """Apply a fitted encoder to a DataFrame split. Returns float32 tensor."""
     parts = []
     cutoff = pd.Timestamp(enc["cutoff"])
 
@@ -211,31 +178,18 @@ def apply_table_encoder(feat_df: pd.DataFrame, enc: dict) -> torch.Tensor:
 
 def build_hetero_data(
     split_db,
-    db_schema,            # original db (for schema: pkey_col, fkey_col_to_pkey_table, time_col)
+    db_schema,
     task,
     label_df: pd.DataFrame,
     cutoff: pd.Timestamp,
-    node_encoders: dict,  # mutated in-place when fit=True
+    node_encoders: dict,
     fit: bool = False,
-    binarize_threshold=None,  # if set, label = (raw > threshold).float()
-    num_classes: int = 1,     # >1 means multiclass: store y as long(class_idx), -1=unlabeled
-    label_offset: int = 0,    # subtracted from raw label to get 0-indexed class
+    num_classes: int = 1,
+    label_offset: int = 0,
 ) -> HeteroData:
-    """
-    Build a HeteroData object from the temporally-filtered split_db.
-
-    split_db   : Database after .upto(cutoff)
-    db_schema  : Original db (for schema info, since split_db has same schema)
-    task       : relbench EntityTask
-    label_df   : task label table (entity_col, time_col, target_col columns)
-    cutoff     : split cutoff timestamp (used for datetime encoding)
-    node_encoders : dict of table_name → encoder dict (fitted on train split)
-    fit        : if True, fit encoders on this split's data (use for train only)
-    """
     data = HeteroData()
 
-    # ── node features ──────────────────────────────────────────────────────
-    pk_to_idx = {}   # table_name → {pk_value: sequential_node_idx}
+    pk_to_idx = {}
 
     for tname, table_schema in db_schema.table_dict.items():
         if tname not in split_db.table_dict:
@@ -253,7 +207,6 @@ def build_hetero_data(
         data[tname].x = x
         data[tname].num_nodes = len(tdf)
 
-        # Build PK → sequential node idx mapping
         pkey = table_schema.pkey_col
         if pkey is not None and pkey in tdf.columns:
             pk_series = tdf[pkey]
@@ -261,7 +214,6 @@ def build_hetero_data(
             pk_series = pd.RangeIndex(len(tdf))
         pk_to_idx[tname] = {pk: idx for idx, pk in enumerate(pk_series)}
 
-        # Time attribute for each node (used optionally by NeighborLoader)
         tcol = table_schema.time_col
         if tcol and tcol in tdf.columns:
             ts = pd.to_datetime(tdf[tcol], errors="coerce")
@@ -269,7 +221,6 @@ def build_hetero_data(
             time_unix = np.where(np.isnat(ts.values), 0, time_unix).astype(np.float64)
             data[tname].time = torch.from_numpy(time_unix).float()
 
-    # ── edges (FK→PK and reversed PK→FK) ──────────────────────────────────
     for tname, table_schema in db_schema.table_dict.items():
         if tname not in split_db.table_dict:
             continue
@@ -280,7 +231,7 @@ def build_hetero_data(
         if child_idx_map is None:
             continue
 
-        child_seq = np.arange(len(tdf))  # sequential node indices of child rows
+        child_seq = np.arange(len(tdf))
 
         for fk_col, parent_tname in table_schema.fkey_col_to_pkey_table.items():
             if parent_tname not in split_db.table_dict:
@@ -296,7 +247,6 @@ def build_hetero_data(
             valid_child = child_seq[valid_mask]
             valid_fk    = fk_vals[valid_mask]
 
-            # map FK values to parent sequential indices
             parent_seq_vals = np.array(
                 [parent_idx_map.get(int(v) if not isinstance(v, float) or not np.isnan(v) else -1, -1)
                  for v in valid_fk]
@@ -310,16 +260,13 @@ def build_hetero_data(
             dst = parent_seq_vals[found].astype(np.int64)
 
             edge_name = f"fk_{fk_col}"
-            # FK→PK (child → parent)
             data[tname, edge_name, parent_tname].edge_index = torch.tensor(
                 np.stack([src, dst]), dtype=torch.long
             )
-            # PK→FK reversed (parent → child)
             data[parent_tname, f"rev_{edge_name}", tname].edge_index = torch.tensor(
                 np.stack([dst, src]), dtype=torch.long
             )
 
-    # ── labels and mask on target node type ───────────────────────────────
     entity_table = task.entity_table
     entity_col   = task.entity_col
     target_col   = task.target_col
@@ -329,13 +276,11 @@ def build_hetero_data(
         n_nodes  = data[entity_table].num_nodes
 
         if num_classes > 1:
-            # Multiclass: y stores 0-indexed class (position-1); -1 = unlabeled
             y = torch.full((n_nodes,), -1, dtype=torch.long)
         else:
             y = torch.full((n_nodes,), float("nan"))
         mask = torch.zeros(n_nodes, dtype=torch.bool)
 
-        # Deduplicate: take the LAST label per entity (most recent timestamp)
         if task.time_col in label_df.columns:
             ldf = label_df.sort_values(task.time_col).groupby(entity_col, sort=False).last().reset_index()
         else:
@@ -347,19 +292,15 @@ def build_hetero_data(
             raw = valid_rows[target_col].values
             if num_classes > 1:
                 class_idxs = raw.astype(int) - label_offset  # normalize to 0-indexed
-                y[node_idxs]    = torch.tensor(class_idxs, dtype=torch.long)
-            elif binarize_threshold is not None:
-                labels = (raw.astype(float) > binarize_threshold).astype(np.float32)
-                y[node_idxs] = torch.from_numpy(labels)
-            elif raw.dtype == object or raw.dtype == bool:
-                # Handle PostgreSQL boolean strings ('t'/'f') and Python bools
-                raw = np.where(raw == 't', 1.0,
-                      np.where(raw == 'f', 0.0,
-                      np.where(raw == True, 1.0,
-                      np.where(raw == False, 0.0, raw))))
-                y[node_idxs] = torch.from_numpy(raw.astype(np.float32))
+                y[node_idxs] = torch.tensor(class_idxs, dtype=torch.long)
             else:
-                y[node_idxs] = torch.from_numpy(raw.astype(np.float32))
+                if raw.dtype == object or raw.dtype == bool:
+                    raw = np.where(raw == 't', 1.0,
+                          np.where(raw == 'f', 0.0,
+                          np.where(raw == True, 1.0,
+                          np.where(raw == False, 0.0, raw))))
+                labels = np.clip(raw.astype(np.float32), 0.0, 1.0)
+                y[node_idxs] = torch.from_numpy(labels)
             mask[node_idxs] = True
 
         data[entity_table].y    = y
@@ -380,19 +321,19 @@ def preprocess_one(dataset_name: str, task_name: str):
     out_dir = PROCESSED / dataset_name / task_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── load relbench objects ───────────────────────────────────────────────
+    # Skip if already done
+    if (out_dir / "meta.json").exists():
+        print(f"  Already processed — skipping (delete meta.json to rerun).")
+        return
+
     dataset = get_dataset(dataset_name, download=True)
     task    = get_task(dataset_name, task_name, download=True)
 
-    if dataset_name == "rel-stack":
+    if dataset_name in ("rel-stack", "rel-avito"):
         patch_rel_stack(dataset)
-    if dataset_name == "rel-avito":
-        patch_rel_stack(dataset)  # same non-consecutive PK issue after .upto()
 
-    db = dataset.get_db()   # filtered to test_timestamp, reindexed PKs/FKs
+    db = dataset.get_db()
 
-    # Drop task-specified leakage columns (e.g. eligibilities-adult removes age/
-    # adult/child columns that directly encode the target, plus free-text fields).
     remove_cols = getattr(task, "remove_columns", None) or []
     for tname, col in remove_cols:
         if tname in db.table_dict and col in db.table_dict[tname].df.columns:
@@ -405,11 +346,10 @@ def preprocess_one(dataset_name: str, task_name: str):
 
     splits = {
         "train": val_ts,
-        "val":   val_ts,    # same graph, different label set
+        "val":   val_ts,
         "test":  test_ts,
     }
 
-    # ── get label tables ────────────────────────────────────────────────────
     print("Loading task tables …")
     label_tables = {
         "train": task.get_table("train", mask_input_cols=False).df,
@@ -417,13 +357,8 @@ def preprocess_one(dataset_name: str, task_name: str):
         "test":  task.get_table("test",  mask_input_cols=False).df,
     }
 
-    # ── build & save one HeteroData per split ──────────────────────────────
-    node_encoders: dict = {}   # fitted on train, reused for val/test
+    node_encoders: dict = {}
     gc.collect()
-
-    binarize_threshold = BINARIZE.get((dataset_name, task_name))
-    if binarize_threshold is not None:
-        print(f"  Binarizing target: votes > {binarize_threshold}")
 
     is_multiclass = (dataset_name, task_name) in MULTICLASS_TASKS
     num_classes = 1
@@ -444,16 +379,15 @@ def preprocess_one(dataset_name: str, task_name: str):
         fit_now  = (split_name == "train")
 
         hdata = build_hetero_data(
-            split_db           = split_db,
-            db_schema          = db,
-            task               = task,
-            label_df           = label_tables[split_name],
-            cutoff             = cutoff,
-            node_encoders      = node_encoders,
-            fit                = fit_now,
-            binarize_threshold = binarize_threshold,
-            num_classes        = num_classes,
-            label_offset       = label_offset,
+            split_db      = split_db,
+            db_schema     = db,
+            task          = task,
+            label_df      = label_tables[split_name],
+            cutoff        = cutoff,
+            node_encoders = node_encoders,
+            fit           = fit_now,
+            num_classes   = num_classes,
+            label_offset  = label_offset,
         )
         del split_db
         gc.collect()
@@ -466,8 +400,6 @@ def preprocess_one(dataset_name: str, task_name: str):
         gc.collect()
         print(f"    saved {out_path.name}  ({n_nodes} nodes in target table, {n_labeled} labeled)")
 
-    # ── save metadata (fitted on train) ────────────────────────────────────
-    # Use train graph for schema
     train_data = torch.load(out_dir / "train.pt", weights_only=False)
     node_types = list(train_data.node_types)
     edge_types = [list(e) for e in train_data.edge_types]
